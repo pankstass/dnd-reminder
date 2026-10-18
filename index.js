@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, Events } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, Events, SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const cron = require('node-cron');
 
 const client = new Client({
@@ -56,16 +56,17 @@ function getRoleMention() {
   return process.env.ROLE_ID ? `<@&${process.env.ROLE_ID}>` : '';
 }
 
-/**
- * Сообщение после 23:00 (следующее событие)
- */
+function createEventLink(event) {
+  return `https://discord.com/events/${event.guildId}/${event.id}`;
+}
+
+// ====================== АВТОМАТИЧЕСКИЕ СООБЩЕНИЯ ======================
+
 async function sendNextEventMessage(channel, nextEvent) {
   if (!nextEvent) {
     await channel.send(`${getRoleMention()} ⚠️ Следующее событие «Подземелье Безумного Стаса» не найдено.`);
     return;
   }
-
-  const link = `https://discord.com/events/${nextEvent.guildId}/${nextEvent.id}`;
 
   const content = [
     `${getRoleMention()} Следующее **Подземелье Безумного Стаса**`,
@@ -73,7 +74,7 @@ async function sendNextEventMessage(channel, nextEvent) {
     `📅 ${ts(nextEvent.scheduledStartTimestamp, 'F')}`,
     `⏳ ${ts(nextEvent.scheduledStartTimestamp, 'R')}`,
     ``,
-    `🔗 [Открыть событие](${link})`,
+    `🔗 [Открыть событие](${createEventLink(nextEvent)})`,
     ``,
     `Не забудьте отметить **Интересно**!`,
   ].join('\n');
@@ -81,44 +82,34 @@ async function sendNextEventMessage(channel, nextEvent) {
   await channel.send({ content });
 }
 
-/**
- * Напоминание в день игры (утром)
- */
 async function sendDayReminder(channel, todayEvent) {
   if (!todayEvent) return;
-
-  const link = `https://discord.com/events/${todayEvent.guildId}/${todayEvent.id}`;
 
   const content = [
     `${getRoleMention()} ${ts(todayEvent.scheduledStartTimestamp, 'F')} **Подземелье Безумного Стаса** — не забудьте.`,
     ``,
     `⏳ Начало ${ts(todayEvent.scheduledStartTimestamp, 'R')}`,
-    `🔗 [Событие](${link})`,
+    `🔗 [Событие](${createEventLink(todayEvent)})`,
   ].join('\n');
 
   await channel.send({ content });
 }
 
-/**
- * Напоминание за 1 час до начала
- */
 async function sendOneHourReminder(channel, event) {
   if (!event) return;
-
-  const link = `https://discord.com/events/${event.guildId}/${event.id}`;
 
   const content = [
     `${getRoleMention()} Через **1 час** начинается **Подземелье Безумного Стаса**!`,
     ``,
     `⏳ ${ts(event.scheduledStartTimestamp, 'R')}`,
-    `🔗 [Событие](${link})`,
+    `🔗 [Событие](${createEventLink(event)})`,
   ].join('\n');
 
   await channel.send({ content });
 }
 
 function startCronJobs() {
-  // 1. Каждый день в 23:05 — если сегодня была игра → следующее событие
+  // 23:05 — следующее событие
   cron.schedule('5 23 * * *', async () => {
     try {
       const guild = await client.guilds.fetch(process.env.GUILD_ID);
@@ -136,7 +127,7 @@ function startCronJobs() {
     }
   }, { timezone: CONFIG.timezone });
 
-  // 2. Каждый день в 10:00 — если сегодня игра → утреннее напоминание
+  // 10:00 — утреннее напоминание
   cron.schedule(`${CONFIG.dayReminderMinute} ${CONFIG.dayReminderHour} * * *`, async () => {
     try {
       const guild = await client.guilds.fetch(process.env.GUILD_ID);
@@ -153,22 +144,18 @@ function startCronJobs() {
     }
   }, { timezone: CONFIG.timezone });
 
-  // 3. Каждую минуту проверяем, нужно ли отправить напоминание за 1 час
+  // Каждую минуту — проверка напоминания за 1 час
   cron.schedule('* * * * *', async () => {
     try {
       const guild = await client.guilds.fetch(process.env.GUILD_ID);
       const channel = await client.channels.fetch(process.env.CHANNEL_ID);
       const events = await getScheduledEvents(guild);
-
       const now = Date.now();
-      const oneHour = 60 * 60 * 1000;
 
       for (const event of events) {
         const timeUntilStart = event.scheduledStartTimestamp - now;
-
-        // Если до начала осталось от 59 до 60 минут
         if (timeUntilStart > 59 * 60 * 1000 && timeUntilStart <= 60 * 60 * 1000) {
-          console.log(`Отправляю напоминание за 1 час для события ${event.name}`);
+          console.log(`Отправляю напоминание за 1 час: ${event.name}`);
           await sendOneHourReminder(channel, event);
         }
       }
@@ -180,27 +167,125 @@ function startCronJobs() {
   console.log('Cron-задачи запущены');
 }
 
-// Команда /next
+// ====================== SLASH-КОМАНДЫ ======================
+
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
 
-  if (interaction.commandName === 'next') {
-    try {
-      const guild = interaction.guild;
-      const events = await getScheduledEvents(guild);
+  const { commandName } = interaction;
+
+  try {
+    // ---------- /ping ----------
+    if (commandName === 'ping') {
+      const sent = await interaction.reply({ content: 'Проверяю...', fetchReply: true });
+      const latency = sent.createdTimestamp - interaction.createdTimestamp;
+      const apiLatency = Math.round(client.ws.ping);
+
+      await interaction.editReply(
+        `🏓 **Понг!**\n` +
+        `Задержка бота: **${latency} мс**\n` +
+        `Задержка API: **${apiLatency} мс**\n` +
+        `Бот работает нормально ✅`
+      );
+    }
+
+    // ---------- /next ----------
+    else if (commandName === 'next') {
+      const events = await getScheduledEvents(interaction.guild);
       const next = getNextEvent(events);
 
       if (!next) {
         return interaction.reply({ content: 'Следующее событие не найдено.', ephemeral: true });
       }
 
-      const link = `https://discord.com/events/${next.guildId}/${next.id}`;
+      const content = [
+        `${getRoleMention()} **Следующее Подземелье Безумного Стаса**`,
+        ``,
+        `📅 ${ts(next.scheduledStartTimestamp, 'F')}`,
+        `⏳ ${ts(next.scheduledStartTimestamp, 'R')}`,
+        ``,
+        `🔗 [Открыть событие](${createEventLink(next)})`,
+      ].join('\n');
+
+      await interaction.reply({ content });
+    }
+
+    // ---------- /today ----------
+    else if (commandName === 'today') {
+      const events = await getScheduledEvents(interaction.guild);
+      const today = getTodayEvent(events);
+
+      if (!today) {
+        return interaction.reply({ content: 'На сегодня игр не запланировано.', ephemeral: true });
+      }
+
+      const content = [
+        `${getRoleMention()} **Сегодня играет Подземелье Безумного Стаса**`,
+        ``,
+        `📅 ${ts(today.scheduledStartTimestamp, 'F')}`,
+        `⏳ ${ts(today.scheduledStartTimestamp, 'R')}`,
+        ``,
+        `🔗 [Событие](${createEventLink(today)})`,
+      ].join('\n');
+
+      await interaction.reply({ content });
+    }
+
+    // ---------- /events ----------
+    else if (commandName === 'events') {
+      const events = await getScheduledEvents(interaction.guild);
+      const upcoming = events.filter(e => e.scheduledStartTimestamp > Date.now()).slice(0, 5);
+
+      if (upcoming.length === 0) {
+        return interaction.reply({ content: 'Ближайших событий не найдено.', ephemeral: true });
+      }
+
+      const list = upcoming.map((e, i) => 
+        `**${i + 1}.** ${ts(e.scheduledStartTimestamp, 'f')} — ${ts(e.scheduledStartTimestamp, 'R')}\n🔗 [Ссылка](${createEventLink(e)})`
+      ).join('\n\n');
+
+      const embed = new EmbedBuilder()
+        .setTitle('📅 Ближайшие Подземелья Безумного Стаса')
+        .setDescription(list)
+        .setColor(0x5865F2)
+        .setFooter({ text: `Всего найдено: ${upcoming.length}` });
+
+      await interaction.reply({ embeds: [embed] });
+    }
+
+    // ---------- /time ----------
+    else if (commandName === 'time') {
+      const now = Date.now();
       await interaction.reply({
-        content: `${getRoleMention()} Следующее: ${ts(next.scheduledStartTimestamp, 'F')} (${ts(next.scheduledStartTimestamp, 'R')})\n${link}`,
+        content: `🕒 Текущее время (по настройкам бота):\n${ts(now, 'F')}\n\nЧасовой пояс: **${CONFIG.timezone}**`,
+        ephemeral: true
       });
-    } catch (err) {
-      console.error(err);
-      await interaction.reply({ content: 'Произошла ошибка.', ephemeral: true });
+    }
+
+    // ---------- /help ----------
+    else if (commandName === 'help') {
+      const embed = new EmbedBuilder()
+        .setTitle('📖 Команды бота')
+        .setDescription('Список доступных команд:')
+        .addFields(
+          { name: '/next', value: 'Показать следующее событие' },
+          { name: '/today', value: 'Информация о сегодняшней игре' },
+          { name: '/events', value: 'Список ближайших событий' },
+          { name: '/ping', value: 'Проверить, работает ли бот' },
+          { name: '/time', value: 'Показать текущее время сервера' },
+          { name: '/help', value: 'Показать это сообщение' },
+        )
+        .setColor(0x57F287);
+
+      await interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+  } catch (err) {
+    console.error(`Ошибка в команде ${commandName}:`, err);
+    if (interaction.replied || interaction.deferred) {
+      await interaction.followUp({ content: 'Произошла ошибка при выполнении команды.', ephemeral: true });
+    } else {
+      await interaction.reply({ content: 'Произошла ошибка при выполнении команды.', ephemeral: true });
     }
   }
 });
