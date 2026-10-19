@@ -167,27 +167,27 @@ async function sendOneHourReminder(channel, event) {
 // ====================== CRON ======================
 
 function startCronJobs() {
-  // 23:05 — анонс следующего события
-  cron.schedule('5 23 * * *', async () => {
-    try {
-      console.log('[Cron 23:05] Запуск задачи');
-      const guild = await client.guilds.fetch(process.env.GUILD_ID);
-      const channel = await client.channels.fetch(process.env.CHANNEL_ID);
-      const events = await getScheduledEvents(guild);
+  // 23:59 — анонс следующего события
+cron.schedule('59 23 * * *', async () => {
+  try {
+    console.log('[Cron 23:59] Запуск задачи');
+    const guild = await client.guilds.fetch(process.env.GUILD_ID);
+    const channel = await client.channels.fetch(process.env.CHANNEL_ID);
+    const events = await getScheduledEvents(guild);
 
-      let nextEvent = getNextEvent(events);
+    let nextEvent = getNextEvent(events);
 
-      // Если Discord не вернул следующее — считаем вручную
-      if (!nextEvent) {
-        console.log('[Cron 23:05] Следующее событие не найдено в API, используем расчёт +14 дней');
-        nextEvent = calculateFallbackNextEvent(events);
-      }
-
-      await sendNextEventMessage(channel, nextEvent);
-    } catch (err) {
-      console.error('[Cron 23:05] Ошибка:', err);
+    // Если Discord не вернул следующее — считаем вручную
+    if (!nextEvent) {
+      console.log('[Cron 23:59] Следующее событие не найдено в API, используем расчёт +14 дней');
+      nextEvent = calculateFallbackNextEvent(events);
     }
-  }, { timezone: CONFIG.timezone });
+
+    await sendNextEventMessage(channel, nextEvent);
+  } catch (err) {
+    console.error('[Cron 23:59] Ошибка:', err);
+  }
+}, { timezone: CONFIG.timezone });
 
   // 10:00 — утреннее напоминание
   cron.schedule(`${CONFIG.dayReminderMinute} ${CONFIG.dayReminderHour} * * *`, async () => {
