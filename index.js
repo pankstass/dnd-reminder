@@ -1,5 +1,5 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, Events, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, Events, EmbedBuilder, MessageFlags } = require('discord.js');
 const cron = require('node-cron');
 
 const client = new Client({
@@ -17,6 +17,7 @@ const CONFIG = {
   timezone: 'Europe/Moscow',
   dayReminderHour: 10,
   dayReminderMinute: 0,
+  eventIntervalDays: 14, // раз в две недели
 };
 // =======================================================
 
@@ -26,44 +27,62 @@ client.once(Events.ClientReady, () => {
 });
 
 /**
- * Возвращает начало и конец "сегодня" по московскому времени
+ * Возвращает границы "сегодня" по Москве
  */
 function getMoscowDayBounds() {
   const now = new Date();
-
-  // Получаем текущую дату в Москве в формате YYYY-MM-DD
-  const moscowDateStr = now.toLocaleDateString('en-CA', { timeZone: CONFIG.timezone }); // 2026-10-19
+  const moscowDateStr = now.toLocaleDateString('en-CA', { timeZone: CONFIG.timezone });
   const [year, month, day] = moscowDateStr.split('-').map(Number);
 
-  // Создаём начало дня в Москве (00:00:00)
-  // Используем Date.UTC и потом корректируем, но проще через временную зону
-  const startOfDayMoscow = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
-  // Москва = UTC+3 (без перехода на летнее в 2026)
-  const offsetMs = 3 * 60 * 60 * 1000;
-  const todayStart = startOfDayMoscow.getTime() - offsetMs;
+  // 00:00 по Москве = 21:00 предыдущего дня UTC
+  const todayStart = Date.UTC(year, month - 1, day, 0, 0, 0) - (3 * 60 * 60 * 1000);
   const todayEnd = todayStart + 24 * 60 * 60 * 1000;
 
   return { todayStart, todayEnd };
 }
 
 async function getScheduledEvents(guild) {
-  const events = await guild.scheduledEvents.fetch();
-  const filtered = [...events.values()]
-    .filter(e => e.name.includes(CONFIG.eventNameIncludes))
-    .sort((a, b) => a.scheduledStartTimestamp - b.scheduledStartTimestamp);
+  try {
+    const events = await guild.scheduledEvents.fetch();
+    const filtered = [...events.values()]
+      .filter(e => e.name.includes(CONFIG.eventNameIncludes))
+      .sort((a, b) => a.scheduledStartTimestamp - b.scheduledStartTimestamp);
 
-  console.log(`[Events] Найдено событий: ${filtered.length}`);
-  filtered.forEach(e => {
-    console.log(`  - ${e.name} | ${new Date(e.scheduledStartTimestamp).toISOString()} | status: ${e.status}`);
-  });
+    console.log(`[Events] Найдено событий: ${filtered.length}`);
+    filtered.forEach(e => {
+      console.log(`  - ${e.name} | ${new Date(e.scheduledStartTimestamp).toISOString()} | status: ${e.status}`);
+    });
 
-  return filtered;
+    return filtered;
+  } catch (err) {
+    console.error('[Events] Ошибка при получении событий:', err);
+    return [];
+  }
 }
 
 function getNextEvent(events) {
   const now = Date.now();
-  // Берём ближайшее будущее событие со статусом SCHEDULED (или любое будущее)
   return events.find(e => e.scheduledStartTimestamp > now) || null;
+}
+
+/**
+ * Если Discord не вернул следующее событие — считаем +14 дней от последнего известного
+ */
+function calculateFallbackNextEvent(events) {
+  if (events.length === 0) return null;
+
+  // Берём самое позднее известное событие
+  const lastKnown = events[events.length - 1];
+  const nextTimestamp = lastKnown.scheduledStartTimestamp + (CONFIG.eventIntervalDays * 24 * 60 * 60 * 1000);
+
+  // Создаём "виртуальный" объект события
+  return {
+    id: null,
+    guildId: lastKnown.guildId,
+    name: lastKnown.name,
+    scheduledStartTimestamp: nextTimestamp,
+    status: 1,
+  };
 }
 
 function getTodayEvent(events) {
@@ -84,6 +103,9 @@ function getRoleMention() {
 }
 
 function createEventLink(event) {
+  if (!event.id) {
+    return null; // виртуальное событие — ссылки нет
+  }
   return `https://discord.com/events/${event.guildId}/${event.id}`;
 }
 
@@ -95,13 +117,16 @@ async function sendNextEventMessage(channel, nextEvent) {
     return;
   }
 
+  const link = createEventLink(nextEvent);
+  const linkLine = link ? `🔗 [Открыть событие](${link})` : `⚠️ Ссылка появится позже (событие ещё не создано Discord)`;
+
   const content = [
     `${getRoleMention()} Следующее **${CONFIG.eventNameIncludes}**`,
     ``,
     `📅 ${ts(nextEvent.scheduledStartTimestamp, 'F')}`,
     `⏳ ${ts(nextEvent.scheduledStartTimestamp, 'R')}`,
     ``,
-    `🔗 [Открыть событие](${createEventLink(nextEvent)})`,
+    linkLine,
     ``,
     `Не забудьте отметить **Интересно**!`,
   ].join('\n');
@@ -112,12 +137,14 @@ async function sendNextEventMessage(channel, nextEvent) {
 async function sendDayReminder(channel, todayEvent) {
   if (!todayEvent) return;
 
+  const link = createEventLink(todayEvent);
+
   const content = [
     `${getRoleMention()} ${ts(todayEvent.scheduledStartTimestamp, 'F')} **${CONFIG.eventNameIncludes}** — не забудьте.`,
     ``,
     `⏳ Начало ${ts(todayEvent.scheduledStartTimestamp, 'R')}`,
-    `🔗 [Событие](${createEventLink(todayEvent)})`,
-  ].join('\n');
+    link ? `🔗 [Событие](${link})` : '',
+  ].filter(Boolean).join('\n');
 
   await channel.send({ content });
 }
@@ -125,12 +152,14 @@ async function sendDayReminder(channel, todayEvent) {
 async function sendOneHourReminder(channel, event) {
   if (!event) return;
 
+  const link = createEventLink(event);
+
   const content = [
     `${getRoleMention()} Через **1 час** начинается **${CONFIG.eventNameIncludes}**!`,
     ``,
     `⏳ ${ts(event.scheduledStartTimestamp, 'R')}`,
-    `🔗 [Событие](${createEventLink(event)})`,
-  ].join('\n');
+    link ? `🔗 [Событие](${link})` : '',
+  ].filter(Boolean).join('\n');
 
   await channel.send({ content });
 }
@@ -141,17 +170,18 @@ function startCronJobs() {
   // 23:05 — анонс следующего события
   cron.schedule('5 23 * * *', async () => {
     try {
-      console.log('[Cron 23:05] Запуск задачи анонса следующего события');
+      console.log('[Cron 23:05] Запуск задачи');
       const guild = await client.guilds.fetch(process.env.GUILD_ID);
       const channel = await client.channels.fetch(process.env.CHANNEL_ID);
       const events = await getScheduledEvents(guild);
 
-      const todayEvent = getTodayEvent(events);
-      console.log('[Cron 23:05] Сегодняшнее событие:', todayEvent ? todayEvent.name : 'не найдено');
+      let nextEvent = getNextEvent(events);
 
-      // Всегда пытаемся найти следующее событие
-      const nextEvent = getNextEvent(events.filter(e => !todayEvent || e.id !== todayEvent.id));
-      console.log('[Cron 23:05] Следующее событие:', nextEvent ? new Date(nextEvent.scheduledStartTimestamp).toISOString() : 'не найдено');
+      // Если Discord не вернул следующее — считаем вручную
+      if (!nextEvent) {
+        console.log('[Cron 23:05] Следующее событие не найдено в API, используем расчёт +14 дней');
+        nextEvent = calculateFallbackNextEvent(events);
+      }
 
       await sendNextEventMessage(channel, nextEvent);
     } catch (err) {
@@ -189,7 +219,7 @@ function startCronJobs() {
       for (const event of events) {
         const timeUntilStart = event.scheduledStartTimestamp - now;
         if (timeUntilStart > 59 * 60 * 1000 && timeUntilStart <= 60 * 60 * 1000) {
-          console.log(`[Cron 1h] Отправляю напоминание за 1 час: ${event.name}`);
+          console.log(`[Cron 1h] Напоминание за 1 час: ${event.name}`);
           await sendOneHourReminder(channel, event);
         }
       }
@@ -209,9 +239,11 @@ client.on(Events.InteractionCreate, async interaction => {
   const { commandName } = interaction;
 
   try {
+    // Сразу подтверждаем взаимодействие, чтобы не получить Unknown interaction
+    await interaction.deferReply();
+
     if (commandName === 'ping') {
-      const sent = await interaction.reply({ content: 'Проверяю...', fetchReply: true });
-      const latency = sent.createdTimestamp - interaction.createdTimestamp;
+      const latency = Date.now() - interaction.createdTimestamp;
       const apiLatency = Math.round(client.ws.ping);
 
       await interaction.editReply(
@@ -221,11 +253,20 @@ client.on(Events.InteractionCreate, async interaction => {
 
     else if (commandName === 'next') {
       const events = await getScheduledEvents(interaction.guild);
-      const next = getNextEvent(events);
+      let next = getNextEvent(events);
 
       if (!next) {
-        return interaction.reply({ content: 'Следующее событие не найдено.', ephemeral: true });
+        next = calculateFallbackNextEvent(events);
       }
+
+      if (!next) {
+        return interaction.editReply('Следующее событие не найдено.');
+      }
+
+      const link = createEventLink(next);
+      const linkLine = link
+        ? `🔗 [Открыть событие](${link})`
+        : `⚠️ Ссылка появится позже (событие ещё формирует Discord)`;
 
       const content = [
         `${getRoleMention()} **Следующее ${CONFIG.eventNameIncludes}**`,
@@ -233,10 +274,10 @@ client.on(Events.InteractionCreate, async interaction => {
         `📅 ${ts(next.scheduledStartTimestamp, 'F')}`,
         `⏳ ${ts(next.scheduledStartTimestamp, 'R')}`,
         ``,
-        `🔗 [Открыть событие](${createEventLink(next)})`,
+        linkLine,
       ].join('\n');
 
-      await interaction.reply({ content });
+      await interaction.editReply({ content });
     }
 
     else if (commandName === 'today') {
@@ -244,19 +285,20 @@ client.on(Events.InteractionCreate, async interaction => {
       const today = getTodayEvent(events);
 
       if (!today) {
-        return interaction.reply({ content: 'На сегодня событий не запланировано.', ephemeral: true });
+        return interaction.editReply('На сегодня событий не запланировано.');
       }
+
+      const link = createEventLink(today);
 
       const content = [
         `${getRoleMention()} **Сегодня: ${CONFIG.eventNameIncludes}**`,
         ``,
         `📅 ${ts(today.scheduledStartTimestamp, 'F')}`,
         `⏳ ${ts(today.scheduledStartTimestamp, 'R')}`,
-        ``,
-        `🔗 [Событие](${createEventLink(today)})`,
-      ].join('\n');
+        link ? `🔗 [Событие](${link})` : '',
+      ].filter(Boolean).join('\n');
 
-      await interaction.reply({ content });
+      await interaction.editReply({ content });
     }
 
     else if (commandName === 'events') {
@@ -264,28 +306,28 @@ client.on(Events.InteractionCreate, async interaction => {
       const upcoming = events.filter(e => e.scheduledStartTimestamp > Date.now()).slice(0, 5);
 
       if (upcoming.length === 0) {
-        return interaction.reply({ content: 'Ближайших событий не найдено.', ephemeral: true });
+        return interaction.editReply('Ближайших событий не найдено.');
       }
 
-      const list = upcoming.map((e, i) =>
-        `**${i + 1}.** ${ts(e.scheduledStartTimestamp, 'f')} — ${ts(e.scheduledStartTimestamp, 'R')}\n🔗 [Ссылка](${createEventLink(e)})`
-      ).join('\n\n');
+      const list = upcoming.map((e, i) => {
+        const link = createEventLink(e);
+        return `**${i + 1}.** ${ts(e.scheduledStartTimestamp, 'f')} — ${ts(e.scheduledStartTimestamp, 'R')}${link ? `\n🔗 [Ссылка](${link})` : ''}`;
+      }).join('\n\n');
 
       const embed = new EmbedBuilder()
-        .setTitle(`📅 Ближайшие события`)
+        .setTitle('📅 Ближайшие события')
         .setDescription(list)
         .setColor(0x5865F2)
-        .setFooter({ text: `Всего найдено: ${upcoming.length}` });
+        .setFooter({ text: `Найдено: ${upcoming.length}` });
 
-      await interaction.reply({ embeds: [embed] });
+      await interaction.editReply({ embeds: [embed] });
     }
 
     else if (commandName === 'time') {
       const now = Date.now();
-      await interaction.reply({
-        content: `🕒 Текущее время (по настройкам бота):\n${ts(now, 'F')}\n\nЧасовой пояс: **${CONFIG.timezone}**`,
-        ephemeral: true
-      });
+      await interaction.editReply(
+        `🕒 Текущее время (по настройкам бота):\n${ts(now, 'F')}\n\nЧасовой пояс: **${CONFIG.timezone}**`
+      );
     }
 
     else if (commandName === 'help') {
@@ -302,16 +344,20 @@ client.on(Events.InteractionCreate, async interaction => {
         )
         .setColor(0x57F287);
 
-      await interaction.reply({ embeds: [embed], ephemeral: true });
+      await interaction.editReply({ embeds: [embed] });
     }
 
   } catch (err) {
     console.error(`Ошибка в команде ${commandName}:`, err);
-    const msg = { content: 'Произошла ошибка при выполнении команды.', ephemeral: true };
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp(msg);
-    } else {
-      await interaction.reply(msg);
+
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply('Произошла ошибка при выполнении команды.');
+      } else {
+        await interaction.reply({ content: 'Произошла ошибка при выполнении команды.', flags: MessageFlags.Ephemeral });
+      }
+    } catch (e) {
+      console.error('Не удалось отправить сообщение об ошибке:', e);
     }
   }
 });
