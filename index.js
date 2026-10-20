@@ -167,7 +167,7 @@ async function sendOneHourReminder(channel, event) {
 // ====================== CRON ======================
 
 function startCronJobs() {
-  // 23:59 — анонс следующего события
+  // 23:59 — анонс следующего события (ТОЛЬКО если сегодня была встреча)
 cron.schedule('59 23 * * *', async () => {
   try {
     console.log('[Cron 23:59] Запуск задачи');
@@ -175,9 +175,18 @@ cron.schedule('59 23 * * *', async () => {
     const channel = await client.channels.fetch(process.env.CHANNEL_ID);
     const events = await getScheduledEvents(guild);
 
-    let nextEvent = getNextEvent(events);
+    const todayEvent = getTodayEvent(events);
 
-    // Если Discord не вернул следующее — считаем вручную
+    if (!todayEvent) {
+      console.log('[Cron 23:59] Сегодня встречи не было — анонс не отправляем');
+      return;
+    }
+
+    console.log('[Cron 23:59] Сегодня была встреча → ищем следующее событие');
+
+    let nextEvent = getNextEvent(events.filter(e => e.id !== todayEvent.id));
+
+    // Если Discord не вернул следующее — считаем вручную +14 дней
     if (!nextEvent) {
       console.log('[Cron 23:59] Следующее событие не найдено в API, используем расчёт +14 дней');
       nextEvent = calculateFallbackNextEvent(events);
